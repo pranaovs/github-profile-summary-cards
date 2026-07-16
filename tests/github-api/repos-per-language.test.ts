@@ -126,6 +126,41 @@ describe('repos per language on github', () => {
         });
     });
 
+    it('excludes repos by name (case-insensitive)', async () => {
+        const dataWithRepoNames = {
+            data: {
+                user: {
+                    repositories: {
+                        nodes: [
+                            {
+                                name: 'Dotfiles',
+                                nameWithOwner: 'vn7n24fzkq/Dotfiles',
+                                primaryLanguage: {color: '#89e051', name: 'Shell'}
+                            },
+                            {
+                                name: 'my-app',
+                                nameWithOwner: 'vn7n24fzkq/my-app',
+                                primaryLanguage: {color: '#b07219', name: 'Java'}
+                            },
+                            {
+                                name: 'my-fork',
+                                nameWithOwner: 'vn7n24fzkq/my-fork',
+                                primaryLanguage: {color: '#dea584', name: 'Rust'}
+                            }
+                        ],
+                        pageInfo: {endCursor: null, hasNextPage: false}
+                    }
+                }
+            }
+        };
+        mock.onPost('https://api.github.com/graphql').reply(200, dataWithRepoNames);
+        // one plain name, one owner/repo form — both must match
+        const repoData = await getRepoLanguages('vn7n24fzkq', [], 'token', ['dotfiles', 'vn7n24fzkq/my-fork']);
+        expect(repoData).toEqual({
+            languageMap: new Map([['Java', {color: '#b07219', count: 1, name: 'Java'}]])
+        });
+    });
+
     it('paginates through every page when not on Vercel (Action/CLI)', async () => {
         delete process.env.VERCEL;
         mock.onPost('https://api.github.com/graphql')

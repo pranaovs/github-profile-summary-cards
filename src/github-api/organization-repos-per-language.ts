@@ -15,6 +15,8 @@ const fetcher = (token: string, variables: any) => {
           ... on Organization {
             repositories(isFork: false, first: 100, after: $endCursor, privacy: PUBLIC, ownerAffiliations: OWNER, orderBy: {direction: DESC, field: STARGAZERS}) {
               nodes {
+                name
+                nameWithOwner
                 primaryLanguage {
                   name
                   color
@@ -38,12 +40,13 @@ const fetcher = (token: string, variables: any) => {
 export async function getOrganizationRepoLanguages(
     login: string,
     exclude: Array<string>,
-    token: string
+    token: string,
+    excludeRepos: Array<string> = []
 ): Promise<RepoLanguages> {
     // Vercel: top-100 by stars in one query. Action/CLI: paginate all. See the
     // note in the user repos-per-language module.
     const repoLanguages = new RepoLanguages();
-    const nodes: {primaryLanguage: {name: string; color: string} | null}[] = [];
+    const nodes: {name: string; nameWithOwner: string; primaryLanguage: {name: string; color: string} | null}[] = [];
     let cursor: string | null = null;
     let hasNextPage = true;
 
@@ -59,15 +62,23 @@ export async function getOrganizationRepoLanguages(
         hasNextPage = !process.env.VERCEL && !!owner.repositories.pageInfo?.hasNextPage;
     }
 
-    nodes.forEach((node: {primaryLanguage: {name: string; color: string} | null}) => {
-        if (node.primaryLanguage) {
-            const langName = node.primaryLanguage.name;
-            const langColor = node.primaryLanguage.color;
-            if (!exclude.includes(langName.toLowerCase())) {
-                repoLanguages.addLanguage(langName, langColor);
+    nodes.forEach(
+        (node: {name: string; nameWithOwner: string; primaryLanguage: {name: string; color: string} | null}) => {
+            if (
+                excludeRepos.includes((node.name ?? '').toLowerCase()) ||
+                excludeRepos.includes((node.nameWithOwner ?? '').toLowerCase())
+            ) {
+                return;
+            }
+            if (node.primaryLanguage) {
+                const langName = node.primaryLanguage.name;
+                const langColor = node.primaryLanguage.color;
+                if (!exclude.includes(langName.toLowerCase())) {
+                    repoLanguages.addLanguage(langName, langColor);
+                }
             }
         }
-    });
+    );
 
     return repoLanguages;
 }
