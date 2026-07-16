@@ -1,4 +1,10 @@
-import {withDataCache, runWithCacheStats, bumpRenderLeaderboard} from '../../src/utils/data-cache';
+import {
+    withDataCache,
+    primeDataCache,
+    runWithCacheStats,
+    isKvHealthy,
+    resetKvHealthForTests
+} from '../../src/utils/data-cache';
 
 const KV_URL = 'https://fake-kv.upstash.io';
 
@@ -20,6 +26,7 @@ describe('withDataCache', () => {
     beforeEach(() => {
         process.env.KV_REST_API_URL = KV_URL;
         process.env.KV_REST_API_TOKEN = 'kv-token';
+        resetKvHealthForTests();
         fetchSpy = jest.spyOn(global, 'fetch');
     });
 
@@ -100,6 +107,7 @@ describe('runWithCacheStats', () => {
     beforeEach(() => {
         process.env.KV_REST_API_URL = KV_URL;
         process.env.KV_REST_API_TOKEN = 'kv-token';
+        resetKvHealthForTests();
         fetchSpy = jest.spyOn(global, 'fetch');
     });
 
@@ -146,12 +154,13 @@ describe('runWithCacheStats', () => {
     });
 });
 
-describe('bumpRenderLeaderboard', () => {
+describe('retention and coalescing', () => {
     let fetchSpy: jest.SpyInstance;
 
     beforeEach(() => {
         process.env.KV_REST_API_URL = KV_URL;
         process.env.KV_REST_API_TOKEN = 'kv-token';
+        resetKvHealthForTests();
         fetchSpy = jest.spyOn(global, 'fetch');
     });
 
@@ -161,26 +170,193 @@ describe('bumpRenderLeaderboard', () => {
         delete process.env.KV_REST_API_TOKEN;
     });
 
-    it('sends a pipeline with all-time and monthly ZINCRBY', async () => {
-        fetchSpy.mockResolvedValueOnce({ok: true, json: async () => []} as Response);
-        await bumpRenderLeaderboard('Torvalds');
-        expect(fetchSpy).toHaveBeenCalledTimes(1);
-        const [url, init] = fetchSpy.mock.calls[0];
-        expect(String(url)).toContain('/pipeline');
-        const commands = JSON.parse(init.body);
-        expect(commands[0]).toEqual(['ZINCRBY', 'leaderboard:renders', '1', 'torvalds']);
-        expect(commands[1][0]).toBe('ZINCRBY');
-        expect(commands[1][1]).toMatch(/^leaderboard:renders:\d{4}-\d{2}$/);
-        expect(commands[2][0]).toBe('EXPIRE');
+    it('uses the retention seconds for the Redis EX', async () => {
+        fetchSpy
+            .mockResolvedValueOnce(missResponse)
+            .mockResolvedValueOnce({ok: true, json: async () => ({})} as Response);
+        await withDataCache('k', jest.fn().mockResolvedValue('x'), {freshSeconds: 60, retentionSeconds: 1234});
+        expect(String(fetchSpy.mock.calls[1][0])).toContain('EX=1234');
     });
 
-    it('is a no-op without KV env and swallows Redis errors', async () => {
-        delete process.env.KV_REST_API_URL;
-        await expect(bumpRenderLeaderboard('a')).resolves.toBeUndefined();
-        expect(fetchSpy).not.toHaveBeenCalled();
+    it('defaults retention to 7 days and keeps the numeric third arg working', async () => {
+        fetchSpy
+            .mockResolvedValueOnce(missResponse)
+            .mockResolvedValueOnce({ok: true, json: async () => ({})} as Response);
+        await withDataCache('k', jest.fn().mockResolvedValue('x'), 60);
+        expect(String(fetchSpy.mock.calls[1][0])).toContain(`EX=${7 * 24 * 60 * 60}`);
+    });
 
+    it('coalesces concurrent lookups of the same key into one fetch', async () => {
+        let resolveKv: (v: Response) => void = () => undefined;
+        fetchSpy
+            .mockReturnValueOnce(new Promise<Response>(resolve => (resolveKv = resolve)))
+            .mockResolvedValueOnce({ok: true, json: async () => ({})} as Response);
+        const fetcher = jest.fn().mockResolvedValue('data');
+
+        const p1 = withDataCache('same-key', fetcher);
+        const p2 = withDataCache('same-key', fetcher);
+        resolveKv(missResponse);
+        await expect(Promise.all([p1, p2])).resolves.toEqual(['data', 'data']);
+        expect(fetcher).toHaveBeenCalledTimes(1);
+
+        // the in-flight entry is cleaned up: a later call fetches again
+        fetchSpy
+            .mockResolvedValueOnce(missResponse)
+            .mockResolvedValueOnce({ok: true, json: async () => ({})} as Response);
+        await withDataCache('same-key', fetcher);
+        expect(fetcher).toHaveBeenCalledTimes(2);
+    });
+
+    it('followers report a fresh cache outcome', async () => {
+        let resolveKv: (v: Response) => void = () => undefined;
+        fetchSpy
+            .mockReturnValueOnce(new Promise<Response>(resolve => (resolveKv = resolve)))
+            .mockResolvedValueOnce({ok: true, json: async () => ({})} as Response);
+        const leader = withDataCache('co-key', jest.fn().mockResolvedValue('data'));
+        const follower = runWithCacheStats(() => withDataCache('co-key', jest.fn()));
+        resolveKv(missResponse);
+        await leader;
+        const {cacheStatus} = await follower;
+        expect(cacheStatus).toBe('fresh');
+    });
+});
+
+describe('circuit breaker', () => {
+    let fetchSpy: jest.SpyInstance;
+
+    beforeEach(() => {
         process.env.KV_REST_API_URL = KV_URL;
-        fetchSpy.mockRejectedValueOnce(new Error('kv down'));
-        await expect(bumpRenderLeaderboard('a')).resolves.toBeUndefined();
+        process.env.KV_REST_API_TOKEN = 'kv-token';
+        resetKvHealthForTests();
+        fetchSpy = jest.spyOn(global, 'fetch');
+    });
+
+    afterEach(() => {
+        fetchSpy.mockRestore();
+        delete process.env.KV_REST_API_URL;
+        delete process.env.KV_REST_API_TOKEN;
+    });
+
+    it('opens after three consecutive KV failures and skips KV entirely', async () => {
+        fetchSpy.mockRejectedValue(new Error('kv down'));
+        for (const key of ['a', 'b', 'c']) {
+            await withDataCache(key, jest.fn().mockResolvedValue('x'));
+        }
+        expect(isKvHealthy()).toBe(false);
+
+        fetchSpy.mockClear();
+        const fetcher = jest.fn().mockResolvedValue('direct');
+        await expect(withDataCache('d', fetcher)).resolves.toBe('direct');
+        expect(fetchSpy).not.toHaveBeenCalled(); // no KV I/O while open
+    });
+
+    it('does not count cache misses as failures', async () => {
+        fetchSpy.mockResolvedValue(missResponse);
+        for (const key of ['a', 'b', 'c', 'd']) {
+            // eslint-disable-next-line no-await-in-loop
+            await withDataCache(key, jest.fn().mockResolvedValue('x'));
+        }
+        expect(isKvHealthy()).toBe(true);
+    });
+
+    it('opens on a write-only outage (reads keep succeeding)', async () => {
+        // GET succeeds with a miss, SET fails — a shared streak would never trip.
+        fetchSpy.mockImplementation((url: RequestInfo | URL) =>
+            String(url).includes('/set/') ? Promise.reject(new Error('write failed')) : Promise.resolve(missResponse)
+        );
+        for (const key of ['a', 'b', 'c']) {
+            // eslint-disable-next-line no-await-in-loop
+            await withDataCache(key, jest.fn().mockResolvedValue('x'));
+        }
+        expect(isKvHealthy()).toBe(false);
+    });
+
+    it('recovers after the cooldown', async () => {
+        fetchSpy.mockRejectedValue(new Error('kv down'));
+        for (const key of ['a', 'b', 'c']) {
+            await withDataCache(key, jest.fn().mockResolvedValue('x'));
+        }
+        expect(isKvHealthy()).toBe(false);
+
+        const nowSpy = jest.spyOn(Date, 'now');
+        nowSpy.mockReturnValue(Date.now() + 61_000);
+        try {
+            expect(isKvHealthy()).toBe(true);
+        } finally {
+            nowSpy.mockRestore();
+        }
+    });
+});
+
+describe('primeDataCache (batched MGET)', () => {
+    let fetchSpy: jest.SpyInstance;
+
+    beforeEach(() => {
+        process.env.KV_REST_API_URL = KV_URL;
+        process.env.KV_REST_API_TOKEN = 'kv-token';
+        resetKvHealthForTests();
+        fetchSpy = jest.spyOn(global, 'fetch');
+    });
+
+    afterEach(() => {
+        fetchSpy.mockRestore();
+        delete process.env.KV_REST_API_URL;
+        delete process.env.KV_REST_API_TOKEN;
+    });
+
+    it('reads many keys with one MGET and serves primed hits without extra GETs', async () => {
+        const now = Date.now();
+        fetchSpy.mockResolvedValueOnce({
+            ok: true,
+            json: async () => ({
+                result: [JSON.stringify({at: now, data: 'v1'}), JSON.stringify({at: now, data: 'v2'})]
+            })
+        } as Response);
+
+        const primed = await primeDataCache(['k1', 'k2']);
+        expect(fetchSpy).toHaveBeenCalledTimes(1);
+        expect(String(fetchSpy.mock.calls[0][0])).toContain('/mget/k1/k2');
+
+        const fetcher = jest.fn();
+        await expect(withDataCache('k1', fetcher, {primed})).resolves.toBe('v1');
+        await expect(withDataCache('k2', fetcher, {primed})).resolves.toBe('v2');
+        expect(fetcher).not.toHaveBeenCalled();
+        expect(fetchSpy).toHaveBeenCalledTimes(1); // still just the MGET
+    });
+
+    it('treats null and corrupt MGET values as misses that re-fetch and store', async () => {
+        fetchSpy
+            .mockResolvedValueOnce({
+                ok: true,
+                json: async () => ({result: [null, 'not-json{']})
+            } as Response)
+            .mockResolvedValue({ok: true, json: async () => ({})} as Response); // SETs
+
+        const primed = await primeDataCache(['k1', 'k2']);
+        const fetcher = jest.fn().mockResolvedValue('fetched');
+        await expect(withDataCache('k1', fetcher, {primed})).resolves.toBe('fetched');
+        await expect(withDataCache('k2', fetcher, {primed})).resolves.toBe('fetched');
+        expect(fetcher).toHaveBeenCalledTimes(2);
+        // no per-key GET happened — only the MGET plus the two SETs
+        const urls = fetchSpy.mock.calls.map(c => String(c[0]));
+        expect(urls.filter(u => u.includes('/get/'))).toHaveLength(0);
+        expect(urls.filter(u => u.includes('/set/'))).toHaveLength(2);
+    });
+
+    it('fails open on MGET errors (empty map, callers fall back per key) and feeds the breaker', async () => {
+        fetchSpy.mockRejectedValue(new Error('kv down'));
+        for (let i = 0; i < 3; i++) {
+            // eslint-disable-next-line no-await-in-loop
+            const primed = await primeDataCache(['a', 'b']);
+            expect(primed.size).toBe(0);
+        }
+        expect(isKvHealthy()).toBe(false);
+    });
+
+    it('is a no-op without keys or KV configuration', async () => {
+        await expect(primeDataCache([])).resolves.toEqual(new Map());
+        delete process.env.KV_REST_API_URL;
+        await expect(primeDataCache(['a'])).resolves.toEqual(new Map());
+        expect(fetchSpy).not.toHaveBeenCalled();
     });
 });
